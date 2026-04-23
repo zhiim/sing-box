@@ -278,7 +278,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedPacketConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
 	}
-	if metadata.FakeIP {
+	if metadata.FakeIP || metadata.DestOverride {
 		conn = bufio.NewNATPacketConn(bufio.NewNetPacketConn(conn), metadata.OriginDestination, metadata.Destination)
 	}
 	if outboundHandler, isHandler := selectedOutbound.(adapter.PacketConnectionHandlerEx); isHandler {
@@ -534,6 +534,13 @@ match:
 				selectedRuleIndex = currentRuleIndex
 				break match
 			}
+		// if new action is RuleActionSniffOverrideDestination
+		case *R.RuleActionSniffOverrideDestination:
+			// if sniff host is not empty
+			if metadata.Domain != "" {
+				// run actionSniffOverrideDestination to override destination
+				r.actionSniffOverrideDestination(ctx, metadata, inputConn, inputPacketConn)
+			}
 		case *R.RuleActionResolve:
 			fatalErr = r.actionResolve(ctx, metadata, action)
 			if fatalErr != nil {
@@ -756,6 +763,29 @@ func (r *Router) actionSniff(
 		}
 	}
 	return
+}
+
+// define actionSniffOverrideDestination
+func (r *Router) actionSniffOverrideDestination(ctx context.Context, metadata *adapter.InboundContext, inputConn net.Conn, inputPacketConn N.PacketConn) {
+	if inputConn != nil {
+		if !metadata.Destination.IsDomain() && M.IsDomainName(metadata.Domain) {
+			metadata.Destination = M.Socksaddr{
+				Fqdn: metadata.Domain,
+				Port: metadata.Destination.Port,
+			}
+			r.logger.DebugContext(ctx, "connection destination is overridden as ", metadata.Domain, ":", metadata.Destination.Port)
+		}
+	} else if inputPacketConn != nil {
+		if !metadata.Destination.IsDomain() && M.IsDomainName(metadata.Domain) {
+			metadata.OriginDestination = metadata.Destination
+			metadata.Destination = M.Socksaddr{
+				Fqdn: metadata.Domain,
+				Port: metadata.Destination.Port,
+			}
+			metadata.DestOverride = true
+			r.logger.DebugContext(ctx, "packet connection destination is overridden as ", metadata.Domain, ":", metadata.Destination.Port)
+		}
+	}
 }
 
 func (r *Router) actionResolve(ctx context.Context, metadata *adapter.InboundContext, action *R.RuleActionResolve) error {
