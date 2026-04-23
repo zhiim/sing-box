@@ -7,6 +7,10 @@ on:
         description: "Version name"
         required: true
         type: string
+      branch:
+        description: "Branch or Tag to build (leave empty for current)"
+        required: false
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
@@ -22,6 +26,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
+          ref: ${{ inputs.branch }}
           fetch-depth: 0
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -50,6 +55,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
+          ref: ${{ inputs.branch }}
           fetch-depth: 0
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -197,6 +203,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
+          ref: ${{ inputs.branch }}
           fetch-depth: 0
       - name: Setup Go
         uses: actions/setup-go@v5
