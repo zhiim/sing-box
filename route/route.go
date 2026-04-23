@@ -785,6 +785,31 @@ func (r *Router) actionResolve(ctx context.Context, metadata *adapter.InboundCon
 			metadata.DestinationAddresses = addresses
 			r.logger.DebugContext(ctx, "resolved [", strings.Join(F.MapToString(metadata.DestinationAddresses), " "), "]")
 		}
+		if len(addresses) > 0 {
+			if isAllIPv4(addresses) {
+				metadata.IPVersion = 4
+			} else if isAllIPv6(addresses) {
+				metadata.IPVersion = 6
+			}
+		}
 	}
 	return nil
+}
+
+func isAllIPv4(addresses []netip.Addr) bool {
+	for _, addr := range addresses {
+		if !addr.Is4() {
+			return false
+		}
+	}
+	return true
+}
+
+func isAllIPv6(addresses []netip.Addr) bool {
+	for _, addr := range addresses {
+		if !addr.Is6() {
+			return false
+		}
+	}
+	return true
 }
