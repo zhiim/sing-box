@@ -28,17 +28,19 @@ const (
 )
 
 const (
-	RuleActionTypeRoute        = "route"
-	RuleActionTypeRouteOptions = "route-options"
-	RuleActionTypeEvaluate     = "evaluate"
-	RuleActionTypeRespond      = "respond"
-	RuleActionTypeDirect       = "direct"
-	RuleActionTypeBypass       = "bypass"
-	RuleActionTypeReject       = "reject"
-	RuleActionTypeHijackDNS    = "hijack-dns"
-	RuleActionTypeSniff        = "sniff"
-	RuleActionTypeResolve      = "resolve"
-	RuleActionTypePredefined   = "predefined"
+	RuleActionTypeRoute                    = "route"
+	RuleActionTypeRouteOptions             = "route-options"
+	RuleActionTypeEvaluate                 = "evaluate"
+	RuleActionTypeRespond                  = "respond"
+	RuleActionTypeDirect                   = "direct"
+	RuleActionTypeBypass                   = "bypass"
+	RuleActionTypeReject                   = "reject"
+	RuleActionTypeHijackDNS                = "hijack-dns"
+	RuleActionTypeSniff                    = "sniff"
+	// add constants for sniff override destination
+	RuleActionTypeSniffOverrideDestination = "sniff-override-destination"
+	RuleActionTypeResolve                  = "resolve"
+	RuleActionTypePredefined               = "predefined"
 )
 
 const (

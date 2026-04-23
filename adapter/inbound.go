@@ -91,6 +91,7 @@ type InboundContext struct {
 	SourceHostname                      string
 	QueryType                           uint16
 	FakeIP                              bool
+	DestOverride                        bool
 
 	// rule cache
 
