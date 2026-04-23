@@ -534,6 +534,13 @@ match:
 				selectedRuleIndex = currentRuleIndex
 				break match
 			}
+		// if new action is RuleActionSniffOverrideDestination
+		case *R.RuleActionSniffOverrideDestination:
+			// if sniff host is not empty
+			if metadata.SniffHost != "" {
+				// run actionSniffOverrideDestination to override destination
+				r.actionSniffOverrideDestination(ctx, metadata, inputConn, inputPacketConn)
+			}
 		case *R.RuleActionResolve:
 			fatalErr = r.actionResolve(ctx, metadata, action)
 			if fatalErr != nil {
@@ -756,6 +763,29 @@ func (r *Router) actionSniff(
 		}
 	}
 	return
+}
+
+// define actionSniffOverrideDestination
+func (r *Router) actionSniffOverrideDestination(ctx context.Context, metadata *adapter.InboundContext, inputConn net.Conn, inputPacketConn N.PacketConn) {
+	if inputConn != nil {
+		if !metadata.Destination.IsDomain() && M.IsDomainName(metadata.SniffHost) {
+			metadata.Destination = M.Socksaddr{
+				Fqdn: metadata.SniffHost,
+				Port: metadata.Destination.Port,
+			}
+			r.logger.DebugContext(ctx, "connection destination is overridden as ", metadata.SniffHost, ":", metadata.Destination.Port)
+		}
+	} else if inputPacketConn != nil {
+		if !metadata.Destination.IsDomain() && M.IsDomainName(metadata.SniffHost) {
+			metadata.OriginDestination = metadata.Destination
+			metadata.Destination = M.Socksaddr{
+				Fqdn: metadata.SniffHost,
+				Port: metadata.Destination.Port,
+			}
+			metadata.DestOverride = true
+			r.logger.DebugContext(ctx, "packet connection destination is overridden as ", metadata.SniffHost, ":", metadata.Destination.Port)
+		}
+	}
 }
 
 func (r *Router) actionResolve(ctx context.Context, metadata *adapter.InboundContext, action *R.RuleActionResolve) error {
