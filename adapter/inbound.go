@@ -60,6 +60,8 @@ type InboundContext struct {
 	SniffError   error
 
 	// cache
+	
+	CacheIPs []netip.Addr  // cached resolved IPS
 
 	// Deprecated: implement in rule action
 	InboundDetour             string
