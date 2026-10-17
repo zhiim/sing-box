@@ -114,18 +114,16 @@ type Service struct {
 	ctx            context.Context
 	logger         log.ContextLogger
 	credentialPath string
+	detour         string
 	credentials    *oauthCredentials
 	users          []option.CCMUser
 	httpClient     *http.Client
 	httpHeaders    http.Header
 	listener       *listener.Listener
 	tlsConfig      tls.ServerConfig
-	httpServer     *http.Server
 	userManager    *UserManager
 	accessMutex    sync.RWMutex
 	usageTracker   *AggregatedUsage
-	trackingGroup  sync.WaitGroup
-	shuttingDown   bool
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.CCMServiceOptions) (adapter.Service, error) {
@@ -162,6 +160,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		usageTracker = &AggregatedUsage{
 			LastUpdated:  time.Now(),
 			Combinations: make([]CostCombination, 0),
+			ctx:          ctx,
 			filePath:     options.UsagesPath,
 			logger:       logger,
 		}
@@ -169,6 +168,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 
 	service := &Service{
 		Adapter:        boxService.NewAdapter(C.TypeCCM, tag),
+		detour:         options.Detour,
 		ctx:            ctx,
 		logger:         logger,
 		credentialPath: options.CredentialPath,
@@ -196,14 +196,14 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 	return service, nil
 }
 
-func (s *Service) Start(stage adapter.StartStage) error {
+func (s *Service) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
 
 	s.userManager.UpdateUsers(s.users)
 
-	credentials, err := platformReadCredentials(s.credentialPath)
+	credentials, err := platformReadCredentials(s.ctx, s.credentialPath)
 	if err != nil {
 		return E.Cause(err, "read credentials")
 	}
@@ -212,26 +212,38 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	if s.usageTracker != nil {
 		err = s.usageTracker.Load()
 		if err != nil {
-			s.logger.Warn("load usage statistics: ", err)
+			s.logger.Error("load usage statistics: ", err, ", usage tracking and saving disabled")
+			s.usageTracker = nil
+		} else {
+			scope.Add(func() error {
+				s.usageTracker.cancelPendingSave()
+				saveErr := s.usageTracker.Save()
+				if saveErr != nil {
+					s.logger.Error("save usage statistics: ", saveErr)
+				}
+				return nil
+			})
 		}
 	}
 
 	router := chi.NewRouter()
 	router.Mount("/", s)
 
-	s.httpServer = &http.Server{Handler: router}
+	httpServer := &http.Server{Handler: router}
 
 	if s.tlsConfig != nil {
 		err = s.tlsConfig.Start()
 		if err != nil {
 			return E.Cause(err, "create TLS config")
 		}
+		scope.Add(s.tlsConfig.Close)
 	}
 
 	tcpListener, err := s.listener.ListenTCP()
 	if err != nil {
 		return err
 	}
+	scope.Add(s.listener.Close)
 
 	if s.tlsConfig != nil {
 		if !common.Contains(s.tlsConfig.NextProtos(), http2.NextProtoTLS) {
@@ -240,8 +252,9 @@ func (s *Service) Start(stage adapter.StartStage) error {
 		tcpListener = aTLS.NewListener(tcpListener, s.tlsConfig)
 	}
 
+	scope.Add(httpServer.Close)
 	go func() {
-		serveErr := s.httpServer.Serve(tcpListener)
+		serveErr := httpServer.Serve(tcpListener)
 		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			s.logger.Error("serve error: ", serveErr)
 		}
@@ -273,7 +286,7 @@ func (s *Service) getAccessToken() (string, error) {
 
 	s.credentials = newCredentials
 
-	err = platformWriteCredentials(newCredentials, s.credentialPath)
+	err = platformWriteCredentials(s.ctx, newCredentials, s.credentialPath)
 	if err != nil {
 		s.logger.Warn("persist refreshed token: ", err)
 	}
@@ -283,8 +296,8 @@ func (s *Service) getAccessToken() (string, error) {
 
 func detectContextWindow(betaHeader string, totalInputTokens int64) int {
 	if totalInputTokens > premiumContextThreshold {
-		features := strings.Split(betaHeader, ",")
-		for _, feature := range features {
+		features := strings.SplitSeq(betaHeader, ",")
+		for feature := range features {
 			if strings.HasPrefix(strings.TrimSpace(feature), "context-1m") {
 				return contextWindowPremium
 			}
@@ -507,8 +520,8 @@ func (s *Service) handleResponseWithTracking(writer http.ResponseWriter, respons
 					continue
 				}
 
-				if bytes.HasPrefix(line, []byte("data: ")) {
-					eventData := bytes.TrimPrefix(line, []byte("data: "))
+				if after, ok0 := bytes.CutPrefix(line, []byte("data: ")); ok0 {
+					eventData := after
 					if bytes.Equal(eventData, []byte("[DONE]")) {
 						continue
 					}
@@ -578,20 +591,9 @@ func (s *Service) handleResponseWithTracking(writer http.ResponseWriter, respons
 	}
 }
 
-func (s *Service) Close() error {
-	err := common.Close(
-		common.PtrOrNil(s.httpServer),
-		common.PtrOrNil(s.listener),
-		s.tlsConfig,
-	)
-
-	if s.usageTracker != nil {
-		s.usageTracker.cancelPendingSave()
-		saveErr := s.usageTracker.Save()
-		if saveErr != nil {
-			s.logger.Error("save usage statistics: ", saveErr)
-		}
+func (s *Service) References() []string {
+	if s.detour == "" {
+		return nil
 	}
-
-	return err
+	return []string{s.detour}
 }

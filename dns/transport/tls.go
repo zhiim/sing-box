@@ -2,7 +2,7 @@ package transport
 
 import (
 	"context"
-	"time"
+	"net"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
@@ -20,7 +20,10 @@ import (
 	mDNS "github.com/miekg/dns"
 )
 
-var _ adapter.DNSTransport = (*TLSTransport)(nil)
+var (
+	_ adapter.DNSTransport         = (*TLSTransport)(nil)
+	_ adapter.IdleConnectionKeeper = (*TLSTransport)(nil)
+)
 
 func RegisterTLS(registry *dns.TransportRegistry) {
 	dns.RegisterTransport[option.RemoteTLSDNSServerOptions](registry, C.DNSTypeTLS, NewTLS)
@@ -28,17 +31,10 @@ func RegisterTLS(registry *dns.TransportRegistry) {
 
 type TLSTransport struct {
 	dns.TransportAdapter
-	logger logger.ContextLogger
-
+	logger      logger.ContextLogger
 	dialer      tls.Dialer
 	serverAddr  M.Socksaddr
-	tlsConfig   tls.Config
-	connections *ConnPool[*tlsDNSConn]
-}
-
-type tlsDNSConn struct {
-	tls.Conn
-	queryId uint16
+	multiplexer *queryMultiplexer
 }
 
 func NewTLS(ctx context.Context, logger log.ContextLogger, tag string, options option.RemoteTLSDNSServerOptions) (adapter.DNSTransport, error) {
@@ -63,80 +59,56 @@ func NewTLS(ctx context.Context, logger log.ContextLogger, tag string, options o
 }
 
 func NewTLSRaw(logger logger.ContextLogger, adapter dns.TransportAdapter, dialer N.Dialer, serverAddr M.Socksaddr, tlsConfig tls.Config) *TLSTransport {
-	return &TLSTransport{
+	t := &TLSTransport{
 		TransportAdapter: adapter,
 		logger:           logger,
 		dialer:           tls.NewDialer(dialer, tlsConfig),
 		serverAddr:       serverAddr,
-		tlsConfig:        tlsConfig,
-		connections: NewConnPool(ConnPoolOptions[*tlsDNSConn]{
-			Mode: ConnPoolOrdered,
-			IsAlive: func(conn *tlsDNSConn) bool {
-				return conn != nil
-			},
-			Close: func(conn *tlsDNSConn, _ error) {
-				conn.Close()
-			},
-		}),
 	}
-}
-
-func (t *TLSTransport) Start(stage adapter.StartStage) error {
-	if stage != adapter.StartStateStart {
-		return nil
-	}
-	return dialer.InitializeDetour(t.dialer)
-}
-
-func (t *TLSTransport) Close() error {
-	return t.connections.Close()
-}
-
-func (t *TLSTransport) Reset() {
-	t.connections.Reset()
-}
-
-func (t *TLSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
-	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		conn, created, err := t.connections.Acquire(ctx, func(ctx context.Context) (*tlsDNSConn, error) {
-			tlsConn, err := t.dialer.DialTLSContext(ctx, t.serverAddr)
+	t.multiplexer = newQueryMultiplexer(queryMultiplexerOptions{
+		dial: func(ctx context.Context) (net.Conn, error) {
+			conn, err := t.dialer.DialTLSContext(ctx, t.serverAddr)
 			if err != nil {
 				return nil, E.Cause(err, "dial TLS connection")
 			}
-			return &tlsDNSConn{Conn: tlsConn}, nil
-		})
-		if err != nil {
-			return nil, err
-		}
-		response, err := t.exchange(ctx, message, conn)
-		if err == nil {
-			t.connections.Release(conn, true)
-			return response, nil
-		}
-		lastErr = err
-		t.logger.DebugContext(ctx, "discarded pooled connection: ", err)
-		t.connections.Release(conn, false)
-		if created {
-			return nil, err
-		}
-	}
-	return nil, lastErr
+			return conn, nil
+		},
+		write: func(conn net.Conn, message *mDNS.Msg, queryId uint16) error {
+			return WriteMessage(conn, queryId, message)
+		},
+		readNext: func(conn net.Conn) (*mDNS.Msg, error) {
+			return ReadMessage(conn)
+		},
+		retryReadError: true,
+		probeReuse:     true,
+	})
+	return t
 }
 
-func (t *TLSTransport) exchange(ctx context.Context, message *mDNS.Msg, conn *tlsDNSConn) (*mDNS.Msg, error) {
-	if deadline, ok := ctx.Deadline(); ok {
-		conn.SetDeadline(deadline)
+func (t *TLSTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	if stage != adapter.StartStateStart {
+		return nil
 	}
-	conn.queryId++
-	err := WriteMessage(conn, conn.queryId, message)
-	if err != nil {
-		return nil, E.Cause(err, "write request")
-	}
-	response, err := ReadMessage(conn)
-	if err != nil {
-		return nil, E.Cause(err, "read response")
-	}
-	conn.SetDeadline(time.Time{})
-	return response, nil
+	scope.Add(t.multiplexer.Close)
+	return dialer.InitializeDetour(t.dialer)
+}
+
+func (t *TLSTransport) Reset() {
+	t.multiplexer.Reset()
+}
+
+func (t *TLSTransport) SetKeepIdleConnections(keep bool) {
+	t.multiplexer.SetKeepIdleConnections(keep)
+}
+
+func (t *TLSTransport) CloseIdleConnections() {
+	t.multiplexer.CloseIdleConnections()
+}
+
+func (t *TLSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
+	return t.multiplexer.Exchange(ctx, message)
+}
+
+func (t *TLSTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
+	t.multiplexer.ExchangeAsync(ctx, message, callback)
 }

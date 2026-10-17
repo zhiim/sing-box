@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"time"
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing-box/adapter"
@@ -16,7 +17,6 @@ import (
 	"github.com/sagernet/sing-box/option"
 	sQUIC "github.com/sagernet/sing-quic"
 	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -79,15 +79,12 @@ func NewQUIC(ctx context.Context, logger log.ContextLogger, tag string, options 
 	}, nil
 }
 
-func (t *Transport) Start(stage adapter.StartStage) error {
+func (t *Transport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
+	scope.Add(t.connection.Close)
 	return dialer.InitializeDetour(t.dialer)
-}
-
-func (t *Transport) Close() error {
-	return t.connection.Close()
 }
 
 func (t *Transport) Reset() {
@@ -100,7 +97,7 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 		err      error
 		response *mDNS.Msg
 	)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		conn, _, err = t.connection.Acquire(ctx, func(ctx context.Context) (*quic.Conn, error) {
 			rawConn, err := t.dialer.DialContext(ctx, N.NetworkUDP, t.serverAddr)
 			if err != nil {
@@ -108,8 +105,7 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 			}
 			earlyConnection, err := sQUIC.DialEarly(
 				ctx,
-				bufio.NewUnbindPacketConn(rawConn),
-				t.serverAddr.UDPAddr(),
+				rawConn,
 				t.tlsConfig,
 				nil,
 			)
@@ -117,6 +113,12 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 				rawConn.Close()
 				return nil, E.Cause(err, "establish QUIC connection")
 			}
+			// quic-go does not take ownership of the packet conn passed to
+			// DialEarly: when the connection ends it only stops reading.
+			go func() {
+				<-earlyConnection.Context().Done()
+				rawConn.Close()
+			}()
 			return earlyConnection, nil
 		})
 		if err != nil {
@@ -138,12 +140,23 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 	return nil, err
 }
 
+func (t *Transport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
+	go func() {
+		callback(t.Exchange(ctx, message))
+	}()
+}
+
 func (t *Transport) exchange(ctx context.Context, message *mDNS.Msg, conn *quic.Conn) (*mDNS.Msg, error) {
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, E.Cause(err, "open stream")
 	}
 	defer stream.CancelRead(0)
+	stopWatch := context.AfterFunc(ctx, func() {
+		stream.CancelRead(0)
+		_ = stream.SetWriteDeadline(time.Now())
+	})
+	defer stopWatch()
 	err = transport.WriteMessage(stream, 0, message)
 	if err != nil {
 		stream.Close()

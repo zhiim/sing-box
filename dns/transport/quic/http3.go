@@ -22,7 +22,6 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
-	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -121,28 +120,33 @@ func (t *HTTP3Transport) newTransport() *http3.Transport {
 			if dialErr != nil {
 				return nil, dialErr
 			}
-			quicConn, dialErr := quic.DialEarly(ctx, bufio.NewUnbindPacketConn(conn), conn.RemoteAddr(), tlsCfg, cfg)
+			quicConn, dialErr := quic.DialEarlyConn(ctx, conn, tlsCfg, cfg)
 			if dialErr != nil {
 				conn.Close()
 				return nil, dialErr
 			}
+			// quic-go does not take ownership of the packet conn passed to
+			// DialEarly: when the connection ends it only stops reading.
+			go func() {
+				<-quicConn.Context().Done()
+				conn.Close()
+			}()
 			return quicConn, nil
 		},
 		TLSClientConfig: t.tlsConfig,
 	}
 }
 
-func (t *HTTP3Transport) Start(stage adapter.StartStage) error {
+func (t *HTTP3Transport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
+	scope.Add(func() error {
+		t.transportAccess.Lock()
+		defer t.transportAccess.Unlock()
+		return t.transport.Close()
+	})
 	return dialer.InitializeDetour(t.dialer)
-}
-
-func (t *HTTP3Transport) Close() error {
-	t.transportAccess.Lock()
-	defer t.transportAccess.Unlock()
-	return t.transport.Close()
 }
 
 func (t *HTTP3Transport) Reset() {
@@ -202,4 +206,10 @@ func (t *HTTP3Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS
 		return nil, err
 	}
 	return &responseMessage, nil
+}
+
+func (t *HTTP3Transport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
+	go func() {
+		callback(t.Exchange(ctx, message))
+	}()
 }
