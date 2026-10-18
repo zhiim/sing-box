@@ -39,10 +39,8 @@ const (
 	RuleActionTypeReject       = "reject"
 	RuleActionTypeHijackDNS    = "hijack-dns"
 	RuleActionTypeSniff        = "sniff"
-	// add constants for sniff override destination
-	RuleActionTypeSniffOverrideDestination = "sniff-override-destination"
-	RuleActionTypeResolve                  = "resolve"
-	RuleActionTypePredefined               = "predefined"
+	RuleActionTypeResolve      = "resolve"
+	RuleActionTypePredefined   = "predefined"
 )
 
 const (

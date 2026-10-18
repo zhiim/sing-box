@@ -104,7 +104,6 @@ type InboundContext struct {
 	QueryDNSSEC                         bool
 	FakeIP                              bool
 	PreMatch                            bool
-	DestOverride                        bool
 
 	// rule cache
 
