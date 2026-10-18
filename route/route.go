@@ -430,6 +430,8 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
 
 func applyRouteOptionsOverride(metadata *adapter.InboundContext, routeOptions *R.RuleActionRouteOptions) {
 	if routeOptions.OverrideAddress.IsValid() {
+		metadata.DestinationAddresses = nil
+		metadata.CacheIPs = nil
 		metadata.Destination = M.Socksaddr{
 			Addr: routeOptions.OverrideAddress.Addr,
 			Port: metadata.Destination.Port,
@@ -629,9 +631,6 @@ match:
 			// TODO: add nat
 			if (routeOptions.OverrideAddress.IsValid() || routeOptions.OverridePort > 0) && !metadata.RouteOriginalDestination.IsValid() {
 				metadata.RouteOriginalDestination = metadata.Destination
-			}
-			if routeOptions.OverrideAddress.IsValid() {
-				metadata.DestinationAddresses = nil
 			}
 			applyRouteOptionsOverride(metadata, routeOptions)
 			if routeOptions.NetworkStrategy != nil {
@@ -950,6 +949,7 @@ func (r *Router) actionResolve(ctx context.Context, metadata *adapter.InboundCon
 			metadata.CacheIPs = addresses
 			r.logger.DebugContext(ctx, "resolved [", strings.Join(F.MapToString(metadata.CacheIPs), " "), "] for match only")
 		} else {
+			metadata.CacheIPs = nil
 			metadata.DestinationAddresses = addresses
 			r.logger.DebugContext(ctx, "resolved [", strings.Join(F.MapToString(metadata.DestinationAddresses), " "), "]")
 		}
