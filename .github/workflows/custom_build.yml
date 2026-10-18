@@ -1,4 +1,4 @@
-name: Build
+name: Custom Build
 
 on:
   workflow_dispatch:
@@ -8,95 +8,113 @@ on:
         required: true
         type: string
       branch:
-        description: "Branch or Tag to build (leave empty for current)"
-        required: false
-        type: string
+        description: "Target branch"
+        required: true
+        type: choice
+        default: "custom_stable"
+        options:
+          - custom_stable
+          - custom_testing
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  group: ${{ github.workflow }}-${{ inputs.branch }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
   calculate_version:
-    name: Calculate version
+    name: Use input version
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.outputs.outputs.version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
-        with:
-          ref: ${{ inputs.branch }}
-          fetch-depth: 0
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ~1.25.8
-      - name: Check input version
-        run: |-
-          echo "version=${{ inputs.version }}"
-          echo "version=${{ inputs.version }}" >> "$GITHUB_ENV"
       - name: Set outputs
         id: outputs
+        env:
+          version: ${{ inputs.version }}
         run: |-
           echo "version=$version" >> "$GITHUB_OUTPUT"
-
   build:
     name: Build binary
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs:
       - calculate_version
     strategy:
+      max-parallel: 13
       matrix:
         include:
           - { os: linux, arch: amd64, variant: musl, naive: true }
-          - { os: android, arch: arm64, ndk: "aarch64-linux-android23" }
+          - { os: linux, arch: amd64, variant: glibc, naive: true }
+          - { os: linux, arch: arm64, variant: musl, naive: true }
+          - { os: linux, arch: arm64, variant: glibc, naive: true }
+          - {
+              os: android,
+              arch: arm64,
+              ndk: "aarch64-linux-android23",
+              naive: true,
+            }
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
           ref: ${{ inputs.branch }}
-          fetch-depth: 0
+          fetch-depth: 1
       - name: Setup Go
+        if: ${{ ! matrix.legacy_win7 }}
         uses: actions/setup-go@v5
         with:
-          go-version: ~1.25.8
+          go-version: 1.26.8
+          cache: false
+      - name: Cache Go modules
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-linux-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-linux-
+      - name: Cache Go for Windows 7
+        if: matrix.legacy_win7
+        id: cache-go-for-windows7
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/go_win7
+          key: go_win7_1268
+      - name: Setup Go for Windows 7
+        if: matrix.legacy_win7 && steps.cache-go-for-windows7.outputs.cache-hit != 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |-
+          .github/setup_go_for_windows7.sh
+      - name: Setup Go for Windows 7
+        if: matrix.legacy_win7
+        run: |-
+          echo "PATH=$HOME/go/go_win7/bin:$PATH" >> $GITHUB_ENV
+          echo "GOROOT=$HOME/go/go_win7" >> $GITHUB_ENV
       - name: Setup Android NDK
         if: matrix.os == 'android'
+        id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r28
-          local-cache: true
       - name: Clone cronet-go
-        if: matrix.naive
+        if: matrix.os == 'linux' && matrix.naive && matrix.variant != 'purego'
         run: |
           set -xeuo pipefail
           CRONET_GO_VERSION=$(cat .github/CRONET_GO_VERSION)
           git init ~/cronet-go
           git -C ~/cronet-go remote add origin https://github.com/sagernet/cronet-go.git
-          git -C ~/cronet-go fetch --depth=1 origin "$CRONET_GO_VERSION"
+          git -C ~/cronet-go sparse-checkout set --no-cone '/*' '!/lib'
+          git -C ~/cronet-go fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
           git -C ~/cronet-go checkout FETCH_HEAD
           git -C ~/cronet-go submodule update --init --recursive --depth=1
       - name: Regenerate Debian keyring
-        if: matrix.naive
+        if: matrix.os == 'linux' && matrix.naive && matrix.variant != 'purego'
         run: |
           set -xeuo pipefail
           rm -f ~/cronet-go/naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg
           cd ~/cronet-go
           GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
-      - name: Cache Chromium toolchain
-        if: matrix.naive
-        id: cache-chromium-toolchain
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/cronet-go/naiveproxy/src/third_party/llvm-build/
-            ~/cronet-go/naiveproxy/src/gn/out/
-            ~/cronet-go/naiveproxy/src/chrome/build/pgo_profiles/
-            ~/cronet-go/naiveproxy/src/out/sysroot-build/
-          key: chromium-toolchain-${{ matrix.arch }}-${{ matrix.variant }}-${{ hashFiles('.github/CRONET_GO_VERSION') }}
       - name: Download Chromium toolchain
-        if: matrix.naive
+        if: matrix.os == 'linux' && matrix.naive && matrix.variant != 'purego'
         run: |
           set -xeuo pipefail
           cd ~/cronet-go
@@ -106,7 +124,7 @@ jobs:
             go run ./cmd/build-naive --target=linux/${{ matrix.arch }} download-toolchain
           fi
       - name: Set Chromium toolchain environment
-        if: matrix.naive
+        if: matrix.os == 'linux' && matrix.naive && matrix.variant != 'purego'
         run: |
           set -xeuo pipefail
           cd ~/cronet-go
@@ -127,13 +145,61 @@ jobs:
           else
             TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
           fi
-          if [[ "${{ matrix.variant }}" == "musl" ]]; then
+          if [[ "${{ matrix.variant }}" == "purego" ]]; then
+            TAGS="${TAGS},with_purego"
+          elif [[ "${{ matrix.variant }}" == "musl" ]]; then
             TAGS="${TAGS},with_musl"
           fi
           echo "BUILD_TAGS=${TAGS}" >> "${GITHUB_ENV}"
       - name: Set shared ldflags
         run: |
           echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "${GITHUB_ENV}"
+      - name: Build (purego)
+        if: matrix.variant == 'purego'
+        run: |
+          set -xeuo pipefail
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sing-box
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          GO386: ${{ matrix.go386 }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+          GOMIPS64: ${{ matrix.gomips }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract libcronet.so
+        if: matrix.variant == 'purego' && matrix.naive
+        run: |
+          set -xeuo pipefail
+          CRONET_GO_VERSION=$(cat .github/CRONET_GO_VERSION)
+          LIBRARY_PATH="lib/${{ matrix.os }}_${{ matrix.arch }}/libcronet.so"
+          git init "$RUNNER_TEMP/cronet-go-lib"
+          git -C "$RUNNER_TEMP/cronet-go-lib" remote add origin https://github.com/sagernet/cronet-go.git
+          git -C "$RUNNER_TEMP/cronet-go-lib" sparse-checkout set --no-cone "/$LIBRARY_PATH"
+          git -C "$RUNNER_TEMP/cronet-go-lib" fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
+          git -C "$RUNNER_TEMP/cronet-go-lib" checkout FETCH_HEAD
+          cp "$RUNNER_TEMP/cronet-go-lib/$LIBRARY_PATH" dist/
+      - name: Build (glibc)
+        if: matrix.variant == 'glibc'
+        run: |
+          set -xeuo pipefail
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sing-box
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          GO386: ${{ matrix.go386 }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+          GOMIPS64: ${{ matrix.gomips }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Build (musl)
         if: matrix.variant == 'musl'
         run: |
@@ -146,6 +212,27 @@ jobs:
           CGO_ENABLED: "1"
           GOOS: linux
           GOARCH: ${{ matrix.arch }}
+          GO386: ${{ matrix.go386 }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+          GOMIPS64: ${{ matrix.gomips }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build (non-variant)
+        if: matrix.os != 'android' && matrix.variant == ''
+        run: |
+          set -xeuo pipefail
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sing-box
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          GO386: ${{ matrix.go386 }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+          GOMIPS64: ${{ matrix.gomips }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Build Android
         if: matrix.os == 'android'
@@ -163,33 +250,141 @@ jobs:
           BUILD_GOOS: ${{ matrix.os }}
           BUILD_GOARCH: ${{ matrix.arch }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
       - name: Set name
         run: |-
           DIR_NAME="sing-box-${{ needs.calculate_version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
-          if [[ "${{ matrix.variant }}" == "musl" ]]; then
+          if [[ -n "${{ matrix.goarm }}" ]]; then
+            DIR_NAME="${DIR_NAME}v${{ matrix.goarm }}"
+          elif [[ -n "${{ matrix.go386 }}" && "${{ matrix.go386 }}" != 'sse2' ]]; then
+            DIR_NAME="${DIR_NAME}-${{ matrix.go386 }}"
+          elif [[ -n "${{ matrix.gomips }}" && "${{ matrix.gomips }}" != 'hardfloat' ]]; then
+            DIR_NAME="${DIR_NAME}-${{ matrix.gomips }}"
+          elif [[ -n "${{ matrix.legacy_name }}" ]]; then
+            DIR_NAME="${DIR_NAME}-legacy-${{ matrix.legacy_name }}"
+          fi
+          if [[ "${{ matrix.variant }}" == "glibc" ]]; then
+            DIR_NAME="${DIR_NAME}-glibc"
+          elif [[ "${{ matrix.variant }}" == "musl" ]]; then
             DIR_NAME="${DIR_NAME}-musl"
           fi
           echo "DIR_NAME=${DIR_NAME}" >> "${GITHUB_ENV}"
+          PKG_VERSION="${{ needs.calculate_version.outputs.version }}"
+          PKG_VERSION="${PKG_VERSION//-/\~}"
+          echo "PKG_VERSION=${PKG_VERSION}" >> "${GITHUB_ENV}"
+      - name: Package DEB
+        if: matrix.debian != ''
+        run: |
+          set -xeuo pipefail
+          sudo gem install fpm
+          sudo apt-get install -y debsigs
+          cp .fpm_systemd .fpm
+          fpm -t deb \
+            -v "$PKG_VERSION" \
+            -p "dist/sing-box_${{ needs.calculate_version.outputs.version }}_${{ matrix.os }}_${{ matrix.debian }}.deb" \
+            --architecture ${{ matrix.debian }} \
+            dist/sing-box=/usr/bin/sing-box
+          rm -rf $HOME/.gnupg
+          gpg --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}" --import <<EOF
+          ${{ secrets.GPG_KEY }}
+          EOF
+          debsigs --sign=origin -k ${{ secrets.GPG_KEY_ID }} --gpgopts '--pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}"' dist/*.deb
+      - name: Package RPM
+        if: matrix.rpm != ''
+        run: |-
+          set -xeuo pipefail
+          sudo gem install fpm
+          echo '%_rpmformat 4' > "$HOME/.rpmmacros"
+          cp .fpm_systemd .fpm
+          fpm -t rpm \
+            -v "$PKG_VERSION" \
+            -p "dist/sing-box_${{ needs.calculate_version.outputs.version }}_${{ matrix.os }}_${{ matrix.rpm }}.rpm" \
+            --architecture ${{ matrix.rpm }} \
+            dist/sing-box=/usr/bin/sing-box
+          cat > $HOME/.rpmmacros <<EOF
+          %_gpg_name ${{ secrets.GPG_KEY_ID }}
+          %_gpg_sign_cmd_extra_args --pinentry-mode loopback --passphrase ${{ secrets.GPG_PASSPHRASE }}
+          EOF
+          gpg --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}" --import <<EOF
+          ${{ secrets.GPG_KEY }}
+          EOF
+          rpmsign --addsign dist/*.rpm
+      - name: Package Pacman
+        if: matrix.pacman != ''
+        run: |-
+          set -xeuo pipefail
+          sudo gem install fpm
+          sudo apt-get update || true
+          sudo apt-get install -y libarchive-tools
+          cp .fpm_pacman .fpm
+          fpm -t pacman \
+            -v "$PKG_VERSION" \
+            -p "dist/sing-box_${{ needs.calculate_version.outputs.version }}_${{ matrix.os }}_${{ matrix.pacman }}.pkg.tar.zst" \
+            --architecture ${{ matrix.pacman }} \
+            dist/sing-box=/usr/bin/sing-box
+      - name: Package OpenWrt
+        if: matrix.openwrt != ''
+        run: |-
+          set -xeuo pipefail
+          sudo gem install fpm
+          cp .fpm_openwrt .fpm
+          fpm -t deb \
+            -v "$PKG_VERSION" \
+            -p "dist/openwrt.deb" \
+            --architecture all \
+            dist/sing-box=/usr/bin/sing-box
+          for architecture in ${{ matrix.openwrt }}; do
+            .github/deb2ipk.sh "$architecture" "dist/openwrt.deb" "dist/sing-box_${{ needs.calculate_version.outputs.version }}_openwrt_${architecture}.ipk"
+          done
+          rm "dist/openwrt.deb"
+      - name: Install apk-tools
+        if: matrix.openwrt != '' || matrix.alpine != ''
+        run: |-
+          docker run --rm -v /usr/local/bin:/mnt alpine:edge sh -c "apk add --no-cache apk-tools-static && cp /sbin/apk.static /mnt/apk && chmod +x /mnt/apk"
+      - name: Package OpenWrt APK
+        if: matrix.openwrt != ''
+        run: |-
+          set -xeuo pipefail
+          for architecture in ${{ matrix.openwrt }}; do
+            .github/build_openwrt_apk.sh \
+              "$architecture" \
+              "${{ needs.calculate_version.outputs.version }}" \
+              "dist/sing-box" \
+              "dist/sing-box_${{ needs.calculate_version.outputs.version }}_openwrt_${architecture}.apk"
+          done
+      - name: Package Alpine APK
+        if: matrix.alpine != ''
+        run: |-
+          set -xeuo pipefail
+          .github/build_alpine_apk.sh \
+            "${{ matrix.alpine }}" \
+            "${{ needs.calculate_version.outputs.version }}" \
+            "dist/sing-box" \
+            "dist/sing-box_${{ needs.calculate_version.outputs.version }}_linux_${{ matrix.alpine }}.apk"
       - name: Archive
         run: |
           set -xeuo pipefail
           cd dist
           mkdir -p "${DIR_NAME}"
           cp ../LICENSE "${DIR_NAME}"
-          cp sing-box "${DIR_NAME}"
-          if [ -f libcronet.so ]; then
-            cp libcronet.so "${DIR_NAME}"
+          if [ '${{ matrix.os }}' = 'windows' ]; then
+            cp sing-box "${DIR_NAME}/sing-box.exe"
+            zip -r "${DIR_NAME}.zip" "${DIR_NAME}"
+          else
+            cp sing-box "${DIR_NAME}"
+            if [ -f libcronet.so ]; then
+              cp libcronet.so "${DIR_NAME}"
+            fi
+            tar -czvf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
           fi
-          tar -czvf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
           rm -r "${DIR_NAME}"
       - name: Cleanup
         run: rm -f dist/sing-box dist/libcronet.so
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sing-box-${{ matrix.os }}_${{ matrix.arch }}${{ matrix.variant && format('-{0}', matrix.variant) }}
+          name: binary-${{ matrix.os }}_${{ matrix.arch }}${{ matrix.goarm && format('v{0}', matrix.goarm) }}${{ matrix.go386 && format('_{0}', matrix.go386) }}${{ matrix.gomips && format('_{0}', matrix.gomips) }}${{ matrix.legacy_name && format('-legacy-{0}', matrix.legacy_name) }}${{ matrix.variant && format('-{0}', matrix.variant) }}
           path: "dist"
-
   build_windows:
     name: Build Windows binaries
     runs-on: windows-latest
@@ -204,11 +399,18 @@ jobs:
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
           ref: ${{ inputs.branch }}
-          fetch-depth: 0
+          fetch-depth: 1
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: ^1.25.4
+          go-version: 1.26.8
+          cache: false
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-windows-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-windows-
       - name: Set tag
         run: |-
           git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$env:GITHUB_ENV"
@@ -227,12 +429,31 @@ jobs:
           GOOS: windows
           GOARCH: ${{ matrix.arch }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build
+        if: ${{ !matrix.naive }}
+        run: |
+          $TAGS = Get-Content release/DEFAULT_BUILD_TAGS_OTHERS
+          $LDFLAGS_SHARED = Get-Content release/LDFLAGS
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box.exe -tags "$TAGS" `
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' $LDFLAGS_SHARED -s -w -buildid=" `
+          ./cmd/sing-box
+        env:
+          CGO_ENABLED: "0"
+          GOOS: windows
+          GOARCH: ${{ matrix.arch }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Extract libcronet.dll
         if: matrix.naive
         run: |
           $CRONET_GO_VERSION = Get-Content .github/CRONET_GO_VERSION
-          $env:CGO_ENABLED = "0"
-          go run -v "github.com/sagernet/cronet-go/cmd/build-naive@$CRONET_GO_VERSION" extract-lib --target windows/${{ matrix.arch }} -o dist
+          $LIBRARY_PATH = "lib/windows_${{ matrix.arch }}/libcronet.dll"
+          git init "$env:RUNNER_TEMP/cronet-go-lib"
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" remote add origin https://github.com/sagernet/cronet-go.git
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" sparse-checkout set --no-cone "/$LIBRARY_PATH"
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" checkout FETCH_HEAD
+          Copy-Item "$env:RUNNER_TEMP/cronet-go-lib/$LIBRARY_PATH" dist
       - name: Archive
         if: matrix.naive
         run: |
@@ -243,11 +464,83 @@ jobs:
           Copy-Item "dist/libcronet.dll" "dist/$DIR_NAME"
           Compress-Archive -Path "dist/$DIR_NAME" -DestinationPath "dist/$DIR_NAME.zip"
           Remove-Item -Recurse "dist/$DIR_NAME"
+      - name: Archive
+        if: ${{ !matrix.naive }}
+        run: |
+          $DIR_NAME = "sing-box-${{ needs.calculate_version.outputs.version }}-windows-${{ matrix.arch }}"
+          mkdir "dist/$DIR_NAME"
+          Copy-Item LICENSE "dist/$DIR_NAME"
+          Copy-Item "dist/sing-box.exe" "dist/$DIR_NAME"
+          Compress-Archive -Path "dist/$DIR_NAME" -DestinationPath "dist/$DIR_NAME.zip"
+          Remove-Item -Recurse "dist/$DIR_NAME"
       - name: Cleanup
         if: matrix.naive
         run: Remove-Item dist/sing-box.exe, dist/libcronet.dll
+      - name: Cleanup
+        if: ${{ !matrix.naive }}
+        run: Remove-Item dist/sing-box.exe
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sing-box-windows_${{ matrix.arch }}
+          name: binary-windows_${{ matrix.arch }}
           path: "dist"
+  cache_gc:
+    name: Cache GC
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    needs:
+      - build
+      - build_windows
+    steps:
+      - name: Delete superseded caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |-
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" --paginate \
+            --jq '.actions_caches[] | [.id, .ref, .created_at, .last_accessed_at, .size_in_bytes, .key] | @tsv' > "$RUNNER_TEMP/caches.tsv"
+          python3 - "$GITHUB_REPOSITORY" "$RUNNER_TEMP/caches.tsv" <<'EOF'
+          import re
+          import subprocess
+          import sys
+
+          repository, list_path = sys.argv[1], sys.argv[2]
+          budget = 9 * 1024 * 1024 * 1024
+          rows = []
+          with open(list_path) as list_file:
+              for line in list_file:
+                  cache_id, ref, created_at, accessed_at, size, key = line.rstrip("\n").split("\t")
+                  family = key
+                  while True:
+                      stripped = re.sub(r"-[0-9a-f]{16,}$", "", family)
+                      if stripped == family:
+                          break
+                      family = stripped
+                  rows.append({
+                      "id": cache_id, "ref": ref, "created": created_at,
+                      "accessed": accessed_at, "size": int(size), "key": key,
+                      "family": family,
+                  })
+          newest = {}
+          for row in rows:
+              group = (row["ref"], row["family"])
+              if group not in newest or row["created"] > newest[group]["created"]:
+                  newest[group] = row
+          doomed = [row for row in rows if newest[(row["ref"], row["family"])] is not row]
+          kept = [row for row in rows if newest[(row["ref"], row["family"])] is row]
+          total = sum(row["size"] for row in kept)
+          for row in sorted(kept, key=lambda entry: entry["accessed"]):
+              if total <= budget:
+                  break
+              doomed.append(row)
+              total -= row["size"]
+          for row in doomed:
+              print(f"delete {row['size'] >> 20}MB {row['key']} ({row['ref']})")
+              subprocess.run(
+                  ["gh", "api", "-X", "DELETE", f"repos/{repository}/actions/caches/{row['id']}"],
+                  check=False,
+              )
+          print(f"kept {len(rows) - len(doomed)} caches, {total >> 20}MB total")
+          EOF
