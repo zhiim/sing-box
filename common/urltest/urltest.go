@@ -148,6 +148,7 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 		return
 	}
 	resp.Body.Close()
+	delay := time.Since(start)
 	if C.URLTestUnifiedDelay {
 		second := time.Now()
 		var ignoredErr error
@@ -156,9 +157,9 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 		if ignoredErr == nil {
 			resp = secondResp
 			resp.Body.Close()
-			start = second
+			delay = time.Since(second)
 		}
 	}
-	t = uint16(time.Since(start) / time.Millisecond)
+	t = uint16(delay / time.Millisecond)
 	return
 }
